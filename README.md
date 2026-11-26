@@ -73,7 +73,7 @@ O usuário da conexão precisa de **permissão de leitura** nas tabelas do schem
 
 ### 2. Importar o app
 
-1. No Qlik Cloud, importe o `receitas-rendimentos.qvf` num espaço.
+1. Baixe o `receitas-rendimentos.qvf` na [última release](https://github.com/dalben/qlik-consinco-receita-rendimento/releases/latest) e importe-o num espaço do Qlik Cloud.
 2. Abra o **Editor de carga de dados** e faça a troca da conexão descrita acima.
 3. Clique em **Carregar dados**.
 
