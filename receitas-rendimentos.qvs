@@ -1,0 +1,410 @@
+///$tab Main
+SET ThousandSep=',';
+SET DecimalSep='.';
+SET MoneyThousandSep=',';
+SET MoneyDecimalSep='.';
+SET MoneyFormat='$ ###0.00;-$ ###0.00';
+SET TimeFormat='h:mm:ss TT';
+SET DateFormat='M/D/YYYY';
+SET TimestampFormat='M/D/YYYY h:mm:ss[.fff] TT';
+SET FirstWeekDay=6;
+SET BrokenWeeks=1;
+SET ReferenceDay=0;
+SET FirstMonthOfYear=1;
+SET CollationLocale='en-US';
+SET CreateSearchIndexOnReload=1;
+SET MonthNames='Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec';
+SET LongMonthNames='January;February;March;April;May;June;July;August;September;October;November;December';
+SET DayNames='Mon;Tue;Wed;Thu;Fri;Sat;Sun';
+SET LongDayNames='Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday';
+SET NumericalAbbreviation='3:k;6:M;9:G;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+///$tab Modelo
+// =====================================================================
+//  RECEITAS E RENDIMENTOS - CONSINCO  |  MODELO UNIFICADO
+//  Estrela com a dimensão Receitas no centro. Todas as tabelas de fatos
+//  se ligam a ela só por %SeqReceitaRaiz:
+//    Arvore (+ Produtos, ArvoreNiveis), ReceitaInsumo (+ Insumos),
+//    ReceitaContem, RedeArestas
+// =====================================================================
+
+LIB CONNECT TO 'ETL:Marketway_Consinco';
+
+IF Len('$(vQtdProduzir)') = 0 THEN
+    SET vQtdProduzir = 1;
+END IF
+
+
+// 1. Cabeçalhos ativos ------------------------------------------------
+// Setores de produção (cadastro de setor)
+MapSetor:
+MAPPING LOAD SEQSETORPROD, DESCSETORPROD;
+SQL
+SELECT sp.seqsetorprod, sp.descsetorprod
+  FROM consinco.mrl_setorprod sp;
+
+TmpCadastros:
+LOAD
+    SEQRECEITARENDTO,
+    RECEITARENDTO,
+    INDRECEITARENDTO,
+    SEQSETORPROD;
+SQL
+SELECT rr.seqreceitarendto,
+       rr.receitarendto,
+       rr.indreceitarendto,
+       rr.seqsetorprod
+  FROM consinco.mrl_receitarendto rr
+ WHERE rr.statusrecrendto = 'A';
+
+MapCadNome:
+MAPPING LOAD SEQRECEITARENDTO, RECEITARENDTO
+RESIDENT TmpCadastros;
+
+// Setor de cada cadastro (receita ou rendimento)
+MapCadSetor:
+MAPPING LOAD SEQRECEITARENDTO,
+             ApplyMap('MapSetor', SEQSETORPROD, 'Sem setor')
+RESIDENT TmpCadastros;
+
+// DIMENSÃO CENTRAL: uma linha por receita ('C')
+Receitas:
+LOAD
+    SEQRECEITARENDTO                                         AS %SeqReceitaRaiz,
+    SEQRECEITARENDTO                                         AS [Receita Código],
+    RECEITARENDTO                                            AS [Receita],
+    SEQSETORPROD                                             AS [Receita Setor Código],
+    ApplyMap('MapSetor', SEQSETORPROD, 'Sem setor')          AS [Receita Setor],
+    If(WildMatch(Upper(RECEITARENDTO),
+                 '*INATIV*', '*REUTILIZAR*', '*TESTE*'),
+       'Sim', 'Não')                                         AS [Receita Cadastro Suspeito],
+    If(WildMatch(Upper(RECEITARENDTO), '*SELF*'),
+       'Sim', 'Não')                                         AS [Receita Self-Service]
+RESIDENT TmpCadastros
+WHERE INDRECEITARENDTO = 'C';
+
+DROP TABLE TmpCadastros;
+
+
+// 2. FATO Arvore (1 linha por nó, explodida no Oracle) -----------------
+//    Só RECEITAS são percorridas (rendimentos removidos da árvore):
+//    produto feito só por rendimento aparece como Insumo (folha).
+//    RAMO_PRINCIPAL: todos os produtores do caminho são o principal
+//                    (receita antes de rendimento, depois menor código)
+//    FOLHA_EXPL    : insumo folha da lista de materiais
+//    FATOR com rateio por quantidade entre produtos finais do cadastro
+Arvore:
+LOAD
+    NO_ID                                                    AS %NoID,
+    NO_PAI_ID                                                AS %NoPaiID,
+    RAIZ                                                     AS %SeqReceitaRaiz,
+    SEQPRODUTO                                               AS %SeqProduto,
+    SEQPRODUTO_PAI                                           AS [Produto Pai Código],
+    NIVEL                                                    AS [Nível],
+    NIVEL_CAD                                                AS [Nível Cadastro],
+    SEQCAD_ORIGEM                                            AS [Origem Código],
+    ApplyMap('MapCadNome', SEQCAD_ORIGEM, Null())            AS [Origem Cadastro],
+    ApplyMap('MapCadSetor', SEQCAD_ORIGEM, Null())           AS [Origem Setor],
+    If(IsNull(SEQCAD_ORIGEM), 'Insumo',
+       If(TIPO_ORIGEM = 'C', 'Receita', 'Rendimento'))       AS [Tipo Nó],
+    TIPO_PAI                                                 AS _TipoPai,
+    QTD_UTILIZADA                                            AS [Qtd Utilizada],
+    QTD_PRODUZIDA                                            AS [Qtd Produzida],
+    FATOR                                                    AS [Fator Acumulado],
+    If(RAMO_PRINCIPAL = 1, 'Sim', 'Não')                     AS [Ramo Principal],
+    If(FOLHA_EXPL = 1, 'Sim', 'Não')                         AS [Folha Explosão];
+SQL
+WITH cad AS (
+    SELECT rr.seqreceitarendto, rr.indreceitarendto
+      FROM consinco.mrl_receitarendto rr
+     WHERE rr.statusrecrendto = 'A'
+       AND rr.indreceitarendto = 'C'
+),
+prod_base AS (
+    SELECT rrpf.seqreceitarendto,
+           rrpf.seqproduto,
+           c.indreceitarendto,
+           SUM(rrpf.qtdunidproduzida) AS qtd_produzida
+      FROM consinco.mrl_rrprodutofinal rrpf
+      JOIN cad c ON c.seqreceitarendto = rrpf.seqreceitarendto
+     WHERE rrpf.status = 'A'
+     GROUP BY rrpf.seqreceitarendto, rrpf.seqproduto, c.indreceitarendto
+),
+produtores AS (
+    SELECT pb.seqreceitarendto,
+           pb.seqproduto,
+           pb.indreceitarendto,
+           pb.qtd_produzida,
+           pb.qtd_produzida
+             / NULLIF(SUM(pb.qtd_produzida) OVER (PARTITION BY pb.seqreceitarendto), 0) AS peso
+      FROM prod_base pb
+),
+filhos AS (
+    SELECT rrc.seqreceitarendto      AS cad_pai,
+           rrc.seqproduto,
+           SUM(rrc.qtdunidutilizada) AS qtd_utilizada
+      FROM consinco.mrl_rrcomponente rrc
+      JOIN cad c ON c.seqreceitarendto = rrc.seqreceitarendto
+     WHERE rrc.statusrrcomponente = 'A'
+     GROUP BY rrc.seqreceitarendto, rrc.seqproduto
+),
+filhos_prod AS (
+    SELECT f.cad_pai,
+           f.seqproduto,
+           f.qtd_utilizada,
+           p.seqreceitarendto  AS cad_filho,
+           p.indreceitarendto  AS tipo_filho,
+           p.qtd_produzida     AS qtd_produzida_filho,
+           p.peso              AS peso_filho,
+           ROW_NUMBER() OVER (PARTITION BY f.cad_pai, f.seqproduto
+                              ORDER BY CASE p.indreceitarendto WHEN 'C' THEN 0 ELSE 1 END,
+                                       p.seqreceitarendto) AS rn
+      FROM filhos f
+      LEFT JOIN produtores p
+        ON p.seqproduto = f.seqproduto
+       AND p.seqreceitarendto <> f.cad_pai
+),
+arvore (raiz, nivel, nivel_cad, no_id, no_pai_id, seqproduto, seqproduto_pai,
+        seqcad_origem, tipo_origem, tipo_pai, qtd_utilizada, qtd_produzida, peso,
+        fator, ramo_principal, expl_ativo, folha_expl) AS (
+    SELECT c.seqreceitarendto,
+           1,
+           1,
+           CAST(TO_CHAR(c.seqreceitarendto) AS VARCHAR2(4000)),
+           CAST(NULL AS VARCHAR2(4000)),
+           p.seqproduto,
+           CAST(NULL AS NUMBER),
+           c.seqreceitarendto,
+           c.indreceitarendto,
+           CASE WHEN 1 = 0 THEN c.indreceitarendto END,
+           CAST(NULL AS NUMBER),
+           p.qtd_produzida,
+           p.peso,
+           CAST(1 AS NUMBER),
+           1,
+           1,
+           0
+      FROM cad c
+      JOIN produtores p ON p.seqreceitarendto = c.seqreceitarendto
+     WHERE c.indreceitarendto = 'C'
+    UNION ALL
+    SELECT a.raiz,
+           a.nivel + 1,
+           a.nivel_cad + CASE WHEN f.cad_filho IS NULL THEN 0 ELSE 1 END,
+           a.no_id || '/' || f.seqproduto || '@' || NVL(f.cad_filho, 0),
+           a.no_id,
+           f.seqproduto,
+           a.seqproduto,
+           f.cad_filho,
+           f.tipo_filho,
+           a.tipo_origem,
+           f.qtd_utilizada,
+           f.qtd_produzida_filho,
+           f.peso_filho,
+           a.fator * f.qtd_utilizada * a.peso / NULLIF(a.qtd_produzida, 0),
+           a.ramo_principal * CASE WHEN f.rn = 1 THEN 1 ELSE 0 END,
+           CASE WHEN a.expl_ativo = 1 AND a.tipo_origem = 'C' AND f.rn = 1
+                THEN 1 ELSE 0 END,
+           CASE WHEN a.expl_ativo = 1 AND a.tipo_origem = 'C' AND f.rn = 1
+                 AND (f.cad_filho IS NULL OR f.tipo_filho <> 'C')
+                THEN 1 ELSE 0 END
+      FROM arvore a
+      JOIN filhos_prod f ON f.cad_pai = a.seqcad_origem
+)
+CYCLE seqcad_origem SET ciclo TO 'S' DEFAULT 'N'
+SELECT raiz, nivel, nivel_cad, no_id, no_pai_id, seqproduto, seqproduto_pai,
+       seqcad_origem, tipo_origem, tipo_pai, qtd_utilizada, qtd_produzida, fator,
+       ramo_principal, folha_expl
+  FROM arvore
+ WHERE ciclo = 'N';
+
+
+// 3. DIMENSÃO Produtos (nós da árvore) --------------------------------
+Produtos:
+LOAD
+    SEQPRODUTO                                               AS %SeqProduto,
+    SEQPRODUTO                                               AS [Produto Código],
+    DESCCOMPLETA                                             AS [Produto]
+WHERE Exists(%SeqProduto, SEQPRODUTO);
+SQL
+SELECT p.seqproduto, p.desccompleta
+  FROM consinco.map_produto p;
+
+MapProdNome:
+MAPPING LOAD %SeqProduto, [Produto]
+RESIDENT Produtos;
+
+// Produto que é componente de alguma receita ativa = Intermediário
+MapProdIntermediario:
+MAPPING LOAD DISTINCT %SeqProduto, 'Intermediário'
+RESIDENT Arvore
+WHERE _TipoPai = 'C';
+
+
+// 4. Atributos calculados da receita ----------------------------------
+LEFT JOIN (Receitas)
+LOAD
+    *,
+    ApplyMap('MapProdNome', [Receita Produto Código],
+             'Produto ' & [Receita Produto Código])          AS [Receita Produto],
+    ApplyMap('MapProdIntermediario', [Receita Produto Código],
+             'Final')                                        AS [Receita Tipo Produto];
+LOAD
+    %SeqReceitaRaiz,
+    Min(If([Nível] = 1, %SeqProduto))                        AS [Receita Produto Código],
+    Max([Nível Cadastro])                                    AS [Receita Profundidade],
+    Count(DISTINCT [Origem Código]) - 1                      AS [Receita Qtd Cadastros Dependentes]
+RESIDENT Arvore
+GROUP BY %SeqReceitaRaiz;
+
+DROP FIELD _TipoPai FROM Arvore;
+
+// Nó sem filhos na árvore (folha) -> usado para colorir o organograma
+MapNoTemFilho:
+MAPPING LOAD DISTINCT %NoPaiID, 'Não'
+RESIDENT Arvore
+WHERE Len(%NoPaiID) > 0;
+
+LEFT JOIN (Arvore)
+LOAD
+    %NoID,
+    ApplyMap('MapNoTemFilho', %NoID, 'Sim')                  AS [Nó Folha]
+RESIDENT Arvore;
+
+
+// 5. Níveis para a tabela dinâmica (1:1 com Arvore por %NoID) ---------
+ArvoreNiveis:
+HIERARCHY (%NoID, _NoPaiTmp, [Nó], [_NoPaiNomeTmp], [Nó], [Caminho], ' > ', [Profundidade Nó])
+LOAD
+    %NoID,
+    %NoPaiID                                                 AS _NoPaiTmp,
+    ApplyMap('MapProdNome', %SeqProduto, 'Produto ' & %SeqProduto) AS [Nó]
+RESIDENT Arvore;
+
+DROP FIELDS _NoPaiTmp, [_NoPaiNomeTmp] FROM ArvoreNiveis;
+
+
+// 6. FATO ReceitaInsumo (lista de materiais: receita x insumo folha) --
+ReceitaInsumo:
+LOAD
+    %SeqReceitaRaiz,
+    %SeqProduto                                              AS %SeqInsumo,
+    Sum([Fator Acumulado])                                   AS [Qtd Insumo por Unidade],
+    Count(%NoID)                                             AS [Insumo Caminhos]
+RESIDENT Arvore
+WHERE [Folha Explosão] = 'Sim'
+GROUP BY %SeqReceitaRaiz, %SeqProduto;
+
+Insumos:
+LOAD DISTINCT
+    %SeqInsumo,
+    %SeqInsumo                                               AS [Insumo Código],
+    ApplyMap('MapProdNome', %SeqInsumo, 'Produto ' & %SeqInsumo) AS [Insumo]
+RESIDENT ReceitaInsumo;
+
+
+// 7. PONTE ReceitaContem (receita x qualquer produto da árvore) -------
+ReceitaContem:
+LOAD DISTINCT
+    %SeqReceitaRaiz,
+    %SeqProduto                                              AS [Contém Produto Código],
+    ApplyMap('MapProdNome', %SeqProduto, 'Produto ' & %SeqProduto) AS [Contém Produto]
+RESIDENT Arvore
+WHERE [Nível] > 1;
+
+
+// 8. FATO RedeArestas (grafo da receita, para o Gráfico de rede) ------
+RedeArestas:
+LOAD DISTINCT
+    %SeqReceitaRaiz,
+    %SeqProduto                                              AS [Rede Produto Código],
+    [Produto Pai Código]                                     AS [Rede Produto Pai Código],
+    ApplyMap('MapProdNome', %SeqProduto, 'Produto ' & %SeqProduto) AS [Rede Produto]
+RESIDENT Arvore;
+
+
+// 9. FATO LigacaoSetor (receita depende de outra receita, QUALQUER nível)
+//    Para cada nó-receita da árvore, todas as receitas ancestrais no
+//    caminho são consumidoras (HierarchyBelongsTo). Uma linha por
+//    receita consumidora x receita fornecedora x produto fornecido.
+//    [Lig Distância] = nº de níveis entre elas (1 = direta).
+//    Liga ao modelo pela receita consumidora (%SeqReceitaRaiz).
+MapNoOrigem:
+MAPPING LOAD %NoID, [Origem Código]
+RESIDENT Arvore;
+
+MapNoTipo:
+MAPPING LOAD %NoID, [Tipo Nó]
+RESIDENT Arvore;
+
+MapNoProd:
+MAPPING LOAD %NoID, %SeqProduto
+RESIDENT Arvore;
+
+MapNoQtd:
+MAPPING LOAD %NoID, [Qtd Utilizada]
+RESIDENT Arvore;
+
+TmpAnc:
+HIERARCHYBELONGSTO (_No, _Pai, _NoNome, _Anc, _AncNome, _Dist)
+LOAD
+    %NoID                                                    AS _No,
+    %NoPaiID                                                 AS _Pai,
+    %NoID                                                    AS _NoNome
+RESIDENT Arvore;
+
+TmpLig0:
+LOAD
+    ApplyMap('MapNoOrigem', _Anc, Null())                    AS _Cons,
+    ApplyMap('MapNoOrigem', _No, Null())                     AS _Forn,
+    ApplyMap('MapNoProd', _No, Null())                       AS _Prod,
+    Fabs(_Dist)                                              AS _Dist,
+    If(Fabs(_Dist) = 1, ApplyMap('MapNoQtd', _No, Null()))   AS _Qtd
+RESIDENT TmpAnc
+WHERE Fabs(_Dist) > 0
+  AND ApplyMap('MapNoTipo', _No, '') = 'Receita';
+
+DROP TABLE TmpAnc;
+
+TmpLig:
+NOCONCATENATE
+LOAD
+    _Cons, _Forn, _Prod,
+    Min(_Dist)                                               AS _Dist,
+    Max(_Qtd)                                                AS _Qtd
+RESIDENT TmpLig0
+WHERE Len(_Cons) > 0 AND _Cons <> _Forn
+GROUP BY _Cons, _Forn, _Prod;
+
+DROP TABLE TmpLig0;
+
+LigacaoSetor:
+LOAD
+    _Cons & '|' & _Forn & '|' & _Prod                        AS %LigacaoID,
+    _Cons                                                    AS %SeqReceitaRaiz,
+    _Cons                                                    AS [Lig Receita Consumidora Código],
+    ApplyMap('MapCadNome', _Cons, _Cons)                     AS [Lig Receita Consumidora],
+    ApplyMap('MapCadSetor', _Cons, 'Sem setor')              AS [Setor Consumidor],
+    _Forn                                                    AS [Lig Receita Fornecedora Código],
+    ApplyMap('MapCadNome', _Forn, _Forn)                     AS [Lig Receita Fornecedora],
+    ApplyMap('MapCadSetor', _Forn, 'Sem setor')              AS [Setor Fornecedor],
+    ApplyMap('MapProdNome', _Prod, 'Produto ' & _Prod)       AS [Lig Produto Fornecido],
+    _Qtd                                                     AS [Lig Qtd Utilizada],
+    _Dist                                                    AS [Lig Distância],
+    If(_Dist = 1, 'Direta', 'Indireta')                      AS [Ligação Alcance],
+    If(ApplyMap('MapCadSetor', _Cons, 'Sem setor')
+         = ApplyMap('MapCadSetor', _Forn, 'Sem setor'),
+       'Mesmo setor', 'Entre setores')                       AS [Ligação Tipo]
+RESIDENT TmpLig;
+
+DROP TABLE TmpLig;
+
+// Receita depende (em qualquer nível) de receita de outro setor?
+LEFT JOIN (Receitas)
+LOAD
+    %SeqReceitaRaiz,
+    If(Count(DISTINCT [Origem Setor]) > 1, 'Sim', 'Não')     AS [Receita Usa Outros Setores],
+    Count(DISTINCT [Origem Setor])                           AS [Receita Qtd Setores na Árvore]
+RESIDENT Arvore
+WHERE [Tipo Nó] = 'Receita'
+GROUP BY %SeqReceitaRaiz;
